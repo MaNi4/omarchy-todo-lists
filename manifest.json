@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "id": "mani4.todo-lists",
+  "name": "To-Do Lists",
+  "version": "1.0.0",
+  "author": "MaNi4",
+  "license": "MIT",
+  "description": "To-do lists in the Omarchy bar, each in a tab of its own: end-to-end encrypted, with a list password of their own for the lists you choose, and synced through a private GitHub repository to your phone",
+  "kinds": [
+    "bar-widget",
+    "service"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml",
+    "service": "Service.qml"
+  },
+  "homepage": "https://github.com/MaNi4/omarchy-todo-lists",
+  "barWidget": {
+    "displayName": "To-Do Lists",
+    "description": "To-do lists in tabs, encrypted, some with a password of their own",
+    "category": "Productivity",
+    "aliases": [
+      "todo",
+      "to-do",
+      "todos",
+      "tasks",
+      "lists",
+      "checklist",
+      "shopping list",
+      "encrypted"
+    ],
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

@@ -1,0 +1,1915 @@
+#!/usr/bin/env python3
+"""The store of the To-Do Lists bar widget (mani4.todo-lists).
+
+Your lists live in one encrypted file, ~/.local/share/omarchy-todo-lists/
+todo-lists.enc, and optionally in a private GitHub repository, so another
+device (the web app on a phone) has them too. This process is the only one
+that reads or writes them: the panels on every monitor send it lines of JSON
+on stdin and show the state it prints, one JSON line per change.
+
+Encryption (see the Crypto section for the file's layout). The to-dos are
+sealed with a random data key; the file's header wraps that key with the
+master password (Argon2id) and for the recovery key. The data key, never
+the master password, is kept in the desktop keyring when there is one, so
+the panel opens without asking; "forget" removes it. The GitHub token is
+kept beside the lists, in github-token.enc, sealed with the data key. A
+locked list has a key of its own, wrapped with its list password and for
+the recovery key; its to-dos' text is sealed again with it, and is only
+shown while the list is unlocked (until the panel closes).
+
+The document is a set of records, so two devices' changes can be merged:
+  {"v": 1,
+   "lists": {id: {"name", "pos", "updated", "by", "deleted"?, "lock"?,
+                  "oldLocks"?, "at"}},
+   "items": {id: {"list", "text" | "sealed" and "k", "done", "completed"?,
+                  "pos", "updated", "by", "deleted"?, "at"}}}
+Each record keeps, per group of its fields ("at": {group: [ms, device]}),
+when they last changed, and a merge keeps the later change of each group:
+a list's name, place and lock; a to-do's text (or sealed text), tick and
+place. A removal wins over changes. A sealed to-do names the lock it was
+sealed with ("k", the lock's id); a list keeps its older locks
+("oldLocks"), so a to-do sealed with one before its device heard of a new
+lock can still be opened with the older list password (or the recovery
+key) and sealed again. Removed records stay as tombstones for 90 days, so a
+removal is not undone by an older copy.
+
+The plugin was first called Reminders: its files and keyring entry are
+moved to the new names on the first start, and a file of that time
+(version 2, labelled "mani4.reminders") is read and written as it is until
+"upgrade" makes it version 3, labelled "mani4.todo-lists".
+
+Commands, one JSON object per line ({"cmd": ...}):
+  create {password}            new, empty lists, with this master password
+                               (and a recovery key, shown once in
+                               "recovery" until ackRecovery)
+  unlock {password}            open the file with the master password
+  recover {code, password}     a forgotten master password: the recovery
+                               key, and a new master password
+  changePassword {old, password}   a new master password
+  upgrade {password}           a version 2 file (the first name's labels)
+                               made version 3, with a new recovery key
+  newRecovery {password}       a new recovery key (the master password
+                               confirms it); the old one stops working
+  ackRecovery                  the recovery key shown was saved
+  setHotkey {hotkey}           the key that opens the panel ("" for none),
+                               kept in todo-lists.json
+  forget                       remove the key from the keyring and close
+  op {op, ...}                 a change to the lists, see apply()
+  unlockList {list, password}  show a locked list until lockLists
+  unlockOld {list, password}   an older list password (or the recovery key), for to-dos
+                               sealed with it before its lock changed; they
+                               are sealed again with the list's lock now
+  lockLists                    lock every unlocked list again
+  setLock {list, password}     lock a list with a password of its own
+  removeLock {list}            unlock it for good (it must be unlocked)
+  changeListPassword {list, password}   (it must be unlocked)
+  recoverList {list, code, password?}   a list's forgotten password: the
+                               recovery key, and a new password (none: the
+                               lock comes off)
+  connect {repo, path?, token, password?}
+                               sync with a private GitHub repository;
+                               with a password and no lists here yet, use
+                               the lists already there (or start them)
+  disconnect                   stop syncing (the token is removed)
+  sync                         sync now
+"""
+import base64
+import hashlib
+import hmac
+import json
+import os
+import re
+import secrets
+import select
+import subprocess
+import sys
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+try:
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ec
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+except ImportError:  # shown in the panel
+    AESGCM = None
+
+CONFIG = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+DATA = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+SETTINGS = os.path.join(CONFIG, "omarchy", "extensions", "todo-lists.json")
+STORE = os.path.join(DATA, "omarchy-todo-lists", "todo-lists.enc")
+TOKEN = os.path.join(DATA, "omarchy-todo-lists", "github-token.enc")
+# Where the first name, Reminders, kept them; moved once (migrate_names).
+OLD_SETTINGS = os.path.join(CONFIG, "omarchy", "extensions", "reminders.json")
+OLD_DATA = os.path.join(DATA, "omarchy-reminders")
+API = os.environ.get("TODO_LISTS_GITHUB_API", "https://api.github.com")
+
+# The file format's name. Versions 1 and 2 carry the plugin's first name.
+FORMAT = "mani4.todo-lists"
+OLD_FORMAT = "mani4.reminders"
+# The keyring entries' service; another one keeps a test copy apart.
+KEYRING = os.environ.get("TODO_LISTS_KEYRING_SERVICE") or "mani4.todo-lists"
+OLD_KEYRING = "mani4.reminders"
+AAD = b"mani4.reminders/v1"          # version 1 only
+ITER = 600000
+MAX_LISTS = 50
+MAX_ITEMS = 1000
+MAX_NAME = 60
+MAX_TEXT = 500
+MAX_FILE = 16 << 20
+KEEP_TOMBSTONES = 90 * 86400 * 1000
+SYNC_EVERY = 300
+SYNC_AFTER_CHANGE = 3
+
+
+# ---------- Small helpers ----------
+
+def b64e(data):
+    return base64.b64encode(data).decode("ascii")
+
+
+def b64d(text):
+    return base64.b64decode(text.encode("ascii") if isinstance(text, str) else b"", validate=True)
+
+
+def now_ms():
+    return int(time.time() * 1000)
+
+
+def clean(text, limit):
+    """One line of text: no control characters, no surrounding space."""
+    text = text if isinstance(text, str) else ""
+    text = "".join(" " if c in "\t\r\n" else c for c in text if c in "\t\r\n" or ord(c) >= 32 and ord(c) != 127)
+    return " ".join(text.split())[:limit]
+
+
+def number(value, fallback=0):
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or value != value:
+        return fallback
+    return value
+
+
+def private_file(path, text):
+    """Writes text to a file only its owner can read: a fresh one (made 0600
+    beside it, then moved over), so an older file's looser mode never stays."""
+    os.makedirs(os.path.dirname(path), mode=0o700, exist_ok=True)
+    tmp = path + ".tmp"
+    try:
+        os.remove(tmp)
+    except FileNotFoundError:
+        pass
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    os.replace(tmp, path)
+
+
+def tighten(path):
+    """A private file someone loosened: written again as a fresh 0600 one."""
+    try:
+        if os.stat(path).st_mode & 0o077:
+            with open(path, encoding="utf-8") as f:
+                private_file(path, f.read(MAX_FILE))
+    except OSError:
+        pass
+
+
+class SameHostRedirect(urllib.request.HTTPRedirectHandler):
+    """Redirects stay on the host asked: the token is never sent elsewhere."""
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).netloc != urllib.parse.urlsplit(req.full_url).netloc:
+            return None
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+OPENER = urllib.request.build_opener(SameHostRedirect)
+
+
+def read_small(path, limit=MAX_FILE):
+    with open(path, encoding="utf-8") as f:
+        return f.read(limit + 1)
+
+
+# ---------- Crypto ----------
+#
+# The file, version 3 (version 2 is the same with the first name's labels;
+# version 1, whose key came from the password itself, is still read, and
+# written again as version 3 once the password is typed):
+#
+#   {"format": "mani4.todo-lists", "v": 3,
+#    "header": {"at": ms,
+#               "password": {"kdf": KDF, "wrapped": b64},
+#               "recovery": {"salt": b64, "pub": b64, "private": b64,
+#                            "wrapped": {"epk": b64, "ct": b64}}},
+#    "iv": b64, "ct": b64}
+#
+# The document is sealed (AES-256-GCM) with a random data key. The header
+# wraps that key twice: with a key derived from the password (Argon2id,
+# KDF = {"name": "Argon2id", "t", "m" (KiB), "p", "salt"}), and for the
+# recovery key, to a P-256 public key (ECDH, HKDF-SHA256, AES-256-GCM)
+# whose private key is sealed with a key derived from the recovery key
+# (HKDF-SHA256). Wrapping to a public key lets any device wrap a new
+# locked list's key for recovery without knowing the recovery key.
+#
+# Argon2id runs in the argon2 command (Omarchy has it: libreoffice and
+# bitwarden-cli need it); the password goes on its stdin, never in its
+# arguments. The salt is a base64 text, given as it is.
+
+# The labels each sealed part carries as associated data, by file version:
+# version 2 has the first name's, version 3 (the same layout) the new one's.
+# A version 2 file stays version 2 until "upgrade" (the master password
+# wraps the data key anew, and a new recovery key comes with it).
+LABELS = {
+    2: {"format": OLD_FORMAT, "doc": b"mani4.reminders/v2/doc", "password": b"mani4.reminders/v2/password",
+        "rec_private": b"mani4.reminders/v2/recovery-private", "rec_wrap": b"mani4.reminders/v2/recovery-wrap",
+        "list_password": b"mani4.reminders/v2/list-password", "list": b"mani4.reminders/list/v1",
+        "token": b"mani4.reminders/token/v1"},
+    3: {"format": FORMAT, "doc": b"mani4.todo-lists/v3/doc", "password": b"mani4.todo-lists/v3/password",
+        "rec_private": b"mani4.todo-lists/v3/recovery-private", "rec_wrap": b"mani4.todo-lists/v3/recovery-wrap",
+        "list_password": b"mani4.todo-lists/v3/list-password", "list": b"mani4.todo-lists/v3/list",
+        "token": b"mani4.todo-lists/v3/token", "header": b"mani4.todo-lists/v3/header-mac"},
+}
+CURRENT = 3
+LIST_AAD = LABELS[2]["list"]          # version 1 locks and to-dos
+ARGON = {"name": "Argon2id", "t": 3, "m": 65536, "p": 1}
+MAX_PASSWORD_BYTES = 127      # the argon2 command takes no more
+MIN_PASSWORD = 12
+MIN_LIST_PASSWORD = 4
+CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def pbkdf2(password, salt, iterations):
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt, iterations, 32)
+
+
+def argon2id(password, salt, t, m, p):
+    data = password.encode("utf-8")
+    if len(data) > MAX_PASSWORD_BYTES:
+        raise ValueError("The password is too long")
+    try:
+        r = subprocess.run(["argon2", salt, "-id", "-t", str(t), "-k", str(m), "-p", str(p), "-l", "32", "-r"],
+                           input=data, capture_output=True, timeout=60)
+    except FileNotFoundError:
+        raise ValueError("The argon2 command is missing: omarchy pkg add argon2")
+    except subprocess.TimeoutExpired:
+        raise ValueError("argon2 took too long")
+    out = r.stdout.decode("ascii", "replace").strip()
+    if r.returncode != 0 or not re.fullmatch(r"[0-9a-f]{64}", out):
+        raise ValueError("argon2 failed")
+    return bytes.fromhex(out)
+
+
+def new_kdf():
+    return dict(ARGON, salt=b64e(secrets.token_bytes(16)).rstrip("="))
+
+
+def clean_kdf(k):
+    """A key derivation as this script makes them, or None."""
+    if not isinstance(k, dict):
+        return None
+    ints = lambda v, lo, hi: isinstance(v, int) and not isinstance(v, bool) and lo <= v <= hi
+    salt = k.get("salt")
+    # A file sets these; no more than 256 MiB and 6 passes, so a file
+    # changed on GitHub cannot freeze a device that opens it.
+    if k.get("name") == "Argon2id" and ints(k.get("t"), 1, 6) and ints(k.get("m"), 8192, 262144) \
+            and ints(k.get("p"), 1, 4) and isinstance(salt, str) and re.fullmatch(r"[A-Za-z0-9+/]{11,64}", salt):
+        return {"name": "Argon2id", "t": k["t"], "m": k["m"], "p": k["p"], "salt": salt}
+    if k.get("name") == "PBKDF2-SHA256" and ints(k.get("iter"), 100000, 10000000) \
+            and isinstance(salt, str) and re.fullmatch(r"[A-Za-z0-9+/]{11,64}={0,2}", salt):
+        return {"name": "PBKDF2-SHA256", "iter": k["iter"], "salt": salt}
+    return None
+
+
+def derive_kdf(password, kdf):
+    if kdf["name"] == "Argon2id":
+        return argon2id(password, kdf["salt"], kdf["t"], kdf["m"], kdf["p"])
+    return pbkdf2(password, b64d(kdf["salt"]), kdf["iter"])
+
+
+def password_problem(password, minimum):
+    """Why a new password will not do, or ""."""
+    if len(password) < minimum:
+        return "Use at least %d characters" % minimum
+    if len(password.encode("utf-8")) > MAX_PASSWORD_BYTES:
+        return "Use at most %d bytes" % MAX_PASSWORD_BYTES
+    return ""
+
+
+def seal(key, data, aad):
+    iv = secrets.token_bytes(12)
+    return iv + AESGCM(key).encrypt(iv, data, aad)
+
+
+def unseal(key, blob, aad):
+    """The data, or None when the key is wrong or the blob was changed."""
+    if key is None or len(blob) < 12 + 16:
+        return None
+    try:
+        return AESGCM(key).decrypt(blob[:12], blob[12:], aad)
+    except (InvalidTag, ValueError):
+        return None
+
+
+def hkdf(ikm, salt, info):
+    return HKDF(algorithm=hashes.SHA256(), length=32, salt=salt, info=info).derive(ikm)
+
+
+def recovery_code():
+    """A recovery key: 160 random bits as 32 Crockford base32 characters,
+    in eight groups of four. Returns (text, bytes)."""
+    raw = secrets.token_bytes(20)
+    n = int.from_bytes(raw, "big")
+    chars = "".join(CROCKFORD[(n >> (5 * i)) & 31] for i in range(31, -1, -1))
+    return "-".join(chars[i:i + 4] for i in range(0, 32, 4)), raw
+
+
+def parse_recovery(text):
+    """The bytes of a recovery key as typed (any case, any dashes or spaces,
+    O for 0 and I or L for 1), or None."""
+    t = re.sub(r"[\s-]", "", str(text or "")).upper().replace("O", "0").replace("I", "1").replace("L", "1")
+    if len(t) != 32 or any(c not in CROCKFORD for c in t):
+        return None
+    n = 0
+    for c in t:
+        n = n * 32 + CROCKFORD.index(c)
+    return n.to_bytes(20, "big")
+
+
+def ec_public_raw(priv):
+    return priv.public_key().public_bytes(serialization.Encoding.X962, serialization.PublicFormat.UncompressedPoint)
+
+
+def wrap_to(pub_raw, secret, aad):
+    """secret for whoever has the private key of pub_raw."""
+    eph = ec.generate_private_key(ec.SECP256R1())
+    epk = ec_public_raw(eph)
+    shared = eph.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), pub_raw))
+    return {"epk": b64e(epk), "ct": b64e(seal(hkdf(shared, epk, aad), secret, aad))}
+
+
+def unwrap_with(priv, wrap, aad):
+    try:
+        epk = b64d(wrap["epk"])
+        shared = priv.exchange(ec.ECDH(), ec.EllipticCurvePublicKey.from_encoded_point(ec.SECP256R1(), epk))
+        return unseal(hkdf(shared, epk, aad), b64d(wrap["ct"]), aad)
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def password_block(dek, password, L):
+    kdf = new_kdf()
+    return {"kdf": kdf, "wrapped": b64e(seal(derive_kdf(password, kdf), dek, L["password"]))}
+
+
+def recovery_block(dek, L):
+    """A new recovery key for a data key: the header's block, and the key."""
+    code, raw = recovery_code()
+    rsalt = secrets.token_bytes(16)
+    priv = ec.generate_private_key(ec.SECP256R1())
+    pkcs8 = priv.private_bytes(serialization.Encoding.DER, serialization.PrivateFormat.PKCS8, serialization.NoEncryption())
+    pub = ec_public_raw(priv)
+    block = {"salt": b64e(rsalt), "pub": b64e(pub),
+             "private": b64e(seal(hkdf(raw, rsalt, L["rec_private"]), pkcs8, L["rec_private"])),
+             "wrapped": wrap_to(pub, dek, L["rec_wrap"])}
+    return block, code
+
+
+def header_mac(dek, header, L):
+    """The header's signature: HMAC-SHA256 of its JSON (without "mac"),
+    with a key derived from the data key. Only a device that holds the data
+    key can make it, so a header changed by anyone else is refused."""
+    if "header" not in L:
+        return None
+    key = hkdf(dek, b"", L["header"])
+    body = json.dumps({k: v for k, v in header.items() if k != "mac"}, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return b64e(hmac.new(key, body.encode("utf-8"), hashlib.sha256).digest())
+
+
+def header_ok(dek, header, L, known=None):
+    """Whether a header may be used: signed with this data key, or (a file
+    from before headers were signed) unsigned and no newer than the one this
+    device knows; such a header is never taken over, only merged past."""
+    mac = header.get("mac")
+    if mac is not None:
+        want = header_mac(dek, header, L)
+        return want is not None and hmac.compare_digest(mac, want)
+    return known is not None and header.get("at", 0) <= known.get("at", 0)
+
+
+def unsigned(header):
+    """The header without its signature, to compare two."""
+    return {k: v for k, v in header.items() if k != "mac"}
+
+
+def recovery_id(header):
+    """A short name of the header's recovery key, which a list's lock keeps
+    to tell whether it is wrapped for this one."""
+    return hashlib.sha256(header["recovery"]["pub"].encode("ascii")).hexdigest()[:16]
+
+
+def new_header(dek, password, L):
+    """A header for a new data key, and the recovery key it was made with."""
+    block, code = recovery_block(dek, L)
+    return {"at": now_ms(), "password": password_block(dek, password, L), "recovery": block}, code
+
+
+def clean_header(h):
+    if not isinstance(h, dict):
+        raise ValueError("no header")
+    pw = h.get("password") or {}
+    rec = h.get("recovery") or {}
+    kdf = clean_kdf(pw.get("kdf"))
+    wrapped = rec.get("wrapped") or {}
+    if not kdf or not isinstance(pw.get("wrapped"), str) or not all(isinstance(rec.get(k), str) for k in ("salt", "pub", "private")) \
+            or not all(isinstance(wrapped.get(k), str) for k in ("epk", "ct")):
+        raise ValueError("a broken header")
+    out = {"at": int(number(h.get("at"))), "password": {"kdf": kdf, "wrapped": pw["wrapped"][:256]},
+           "recovery": {"salt": rec["salt"][:64], "pub": rec["pub"][:256], "private": rec["private"][:1024],
+                        "wrapped": {"epk": wrapped["epk"][:256], "ct": wrapped["ct"][:256]}}}
+    if isinstance(h.get("mac"), str):
+        out["mac"] = h["mac"][:64]
+    return out
+
+
+def dek_from_password(header, password, L):
+    try:
+        return unseal(derive_kdf(password, header["password"]["kdf"]), b64d(header["password"]["wrapped"]), L["password"])
+    except (ValueError, KeyError):
+        return None
+
+
+def recovery_private(header, code, L):
+    """The recovery private key, opened with a recovery key, or None."""
+    raw = parse_recovery(code)
+    if raw is None:
+        return None
+    try:
+        rec = header["recovery"]
+        pkcs8 = unseal(hkdf(raw, b64d(rec["salt"]), L["rec_private"]), b64d(rec["private"]), L["rec_private"])
+        return serialization.load_der_private_key(pkcs8, None) if pkcs8 else None
+    except (ValueError, KeyError, TypeError):
+        return None
+
+
+def envelope(doc, dek, header, version):
+    L = LABELS[version]
+    mac = header_mac(dek, header, L)
+    if mac:
+        header = dict(header, mac=mac)
+    blob = seal(dek, json.dumps(doc, ensure_ascii=False, separators=(",", ":"), sort_keys=True).encode("utf-8"), L["doc"])
+    return {"format": L["format"], "v": version, "header": header, "iv": b64e(blob[:12]), "ct": b64e(blob[12:])}
+
+
+def envelope_version(env):
+    """1, 2 or 3; versions 1 and 2 carry the first name."""
+    if isinstance(env, dict) and (env.get("format"), env.get("v")) in ((OLD_FORMAT, 1), (OLD_FORMAT, 2), (FORMAT, 3)):
+        return env["v"]
+    raise ValueError("not a To-Do Lists file")
+
+
+def open_doc(env, dek):
+    """The document in a version 2 or 3 envelope, or None when the key does
+    not open it."""
+    try:
+        data = unseal(dek, b64d(env.get("iv", "")) + b64d(env.get("ct", "")), LABELS[env["v"]]["doc"])
+    except (ValueError, KeyError):
+        return None
+    return tidy(json.loads(data.decode("utf-8"))) if data is not None else None
+
+
+def open_v1(env, password):
+    """The document in a version 1 envelope, with the password, or None."""
+    kdf = clean_kdf(env.get("kdf"))
+    if not kdf:
+        raise ValueError("unknown key derivation")
+    try:
+        data = unseal(derive_kdf(password, kdf), b64d(env.get("iv", "")) + b64d(env.get("ct", "")), AAD)
+    except ValueError:
+        return None
+    return tidy(json.loads(data.decode("utf-8"))) if data is not None else None
+
+
+# ---------- Keyring ----------
+
+def keyring_get(kind, service=None):
+    try:
+        r = subprocess.run(["secret-tool", "lookup", "service", service or KEYRING, "kind", kind],
+                           capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    return r.stdout.decode("utf-8", "replace").strip()[:4096] if r.returncode == 0 and r.stdout else None
+
+
+def keyring_has_default():
+    try:
+        r = subprocess.run(["busctl", "--user", "call", "org.freedesktop.secrets", "/org/freedesktop/secrets",
+                            "org.freedesktop.Secret.Service", "ReadAlias", "s", "default"],
+                           capture_output=True, timeout=5)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    out = r.stdout.decode("utf-8", "replace").strip()
+    return r.returncode == 0 and out.startswith("o ") and out != 'o "/"'
+
+
+def keyring_set(kind, secret, label):
+    """Stores a secret, given on stdin, never as an argument: in the default
+    keyring ("keyring"), else in the session one, kept in memory until the
+    computer restarts ("session"); False when neither takes it."""
+    tries = [("session", ["--collection", "/org/freedesktop/secrets/collection/session"])]
+    # Without a default collection, storing there asks to make one, in a
+    # dialog; so it is only tried when there is one.
+    if keyring_has_default():
+        tries.insert(0, ("keyring", []))
+    for where, extra in tries:
+        try:
+            r = subprocess.run(["secret-tool", "store"] + extra + ["--label", label, "service", KEYRING, "kind", kind],
+                               input=secret.encode("utf-8"), capture_output=True, timeout=10)
+        except (OSError, subprocess.TimeoutExpired):
+            return False
+        if r.returncode == 0:
+            return where
+    return False
+
+
+def keyring_clear(kind, service=None):
+    try:
+        subprocess.run(["secret-tool", "clear", "service", service or KEYRING, "kind", kind], capture_output=True, timeout=10)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+# ---------- The document ----------
+
+def empty_doc():
+    return {"v": 1, "lists": {}, "items": {}}
+
+
+LIST_GROUPS = {"name": ("name",), "pos": ("pos",), "lock": ("lock",), "color": ("color",)}
+# A list's color, by name (the phone's web app shows it); one without gets
+# one from its id there.
+COLORS = ("red", "orange", "yellow", "green", "teal", "blue", "indigo", "purple", "pink", "gray")
+ITEM_GROUPS = {"text": ("text", "sealed", "k"), "done": ("done", "completed"), "pos": ("pos",)}
+MAX_OLD_LOCKS = 10
+
+
+def clean_lock(lock):
+    """A list's lock, by "id" (the id its to-dos name in "k"). Version 2:
+    {"id", "kdf", "pw": the list key sealed with the list password's key,
+    "rec": the list key wrapped for the recovery key}. Version 1 (a key
+    straight from the password): {"salt", "iter", "check"}, its id the salt."""
+    if not isinstance(lock, dict):
+        return None
+    lock_id = lock.get("id") if isinstance(lock.get("id"), str) else lock.get("salt")
+    if not isinstance(lock_id, str) or not lock_id:
+        return None
+    kdf = clean_kdf(lock.get("kdf"))
+    rec = lock.get("rec") if isinstance(lock.get("rec"), dict) else {}
+    if kdf and isinstance(lock.get("pw"), str) and all(isinstance(rec.get(k), str) for k in ("epk", "ct")):
+        out = {"id": lock_id[:64], "kdf": kdf, "pw": lock["pw"][:256],
+               "rec": {"epk": rec["epk"][:256], "ct": rec["ct"][:256]}}
+        if isinstance(lock.get("rp"), str):
+            out["rp"] = lock["rp"][:32]
+        return out
+    it = lock.get("iter")
+    if isinstance(lock.get("salt"), str) and isinstance(lock.get("check"), str) and isinstance(it, int) and not isinstance(it, bool):
+        return {"id": lock["salt"][:64], "salt": lock["salt"][:64], "iter": it, "check": lock["check"][:256]}
+    return None
+
+
+def clean_at(rec, raw, groups):
+    """Each group's own time of change, [ms, device]; an older file without
+    them gets the record's own for all."""
+    at = raw.get("at") if isinstance(raw.get("at"), dict) else {}
+    out = {}
+    for g in groups:
+        v = at.get(g)
+        if isinstance(v, list) and len(v) == 2 and isinstance(v[0], int) and not isinstance(v[0], bool) and isinstance(v[1], str):
+            out[g] = [v[0], v[1][:32]]
+        else:
+            out[g] = [rec["updated"], rec["by"]]
+    return out
+
+
+def tidy(doc):
+    """The document as this script writes it, whatever was found in it."""
+    out = empty_doc()
+    if not isinstance(doc, dict):
+        return out
+    lists = doc.get("lists") if isinstance(doc.get("lists"), dict) else {}
+    items = doc.get("items") if isinstance(doc.get("items"), dict) else {}
+    for lid, l in list(lists.items())[:MAX_LISTS * 4]:
+        if not isinstance(lid, str) or not re.fullmatch(r"[0-9a-f]{8,32}", lid) or not isinstance(l, dict):
+            continue
+        rec = {"updated": int(number(l.get("updated"))), "by": str(l.get("by") or "")[:32]}
+        if l.get("deleted") is True:
+            rec["deleted"] = True
+        else:
+            rec["name"] = clean(l.get("name"), MAX_NAME) or "List"
+            rec["pos"] = float(number(l.get("pos")))
+            if l.get("color") in COLORS:
+                rec["color"] = l["color"]
+            lock = clean_lock(l.get("lock"))
+            if lock:
+                rec["lock"] = lock
+            olds = [clean_lock(o) for o in (l.get("oldLocks") if isinstance(l.get("oldLocks"), list) else [])]
+            olds = [o for o in olds if o and (not lock or o["id"] != lock["id"])][:MAX_OLD_LOCKS]
+            if olds:
+                rec["oldLocks"] = olds
+            rec["at"] = clean_at(rec, l, LIST_GROUPS)
+        out["lists"][lid] = rec
+    for iid, it in list(items.items())[:MAX_LISTS * MAX_ITEMS * 2]:
+        if not isinstance(iid, str) or not re.fullmatch(r"[0-9a-f]{8,32}", iid) or not isinstance(it, dict):
+            continue
+        rec = {"list": str(it.get("list") or "")[:32], "updated": int(number(it.get("updated"))),
+               "by": str(it.get("by") or "")[:32]}
+        if it.get("deleted") is True:
+            rec["deleted"] = True
+        else:
+            if isinstance(it.get("sealed"), str):
+                rec["sealed"] = it["sealed"][:4096]
+                k = it.get("k")
+                if not isinstance(k, str):
+                    # Sealed before items named their lock: the list's own.
+                    lst = out["lists"].get(rec["list"]) or {}
+                    k = (lst.get("lock") or {}).get("id", "")
+                rec["k"] = k[:64]
+            else:
+                text = clean(it.get("text"), MAX_TEXT)
+                if not text:
+                    continue
+                rec["text"] = text
+            rec["done"] = it.get("done") is True
+            rec["pos"] = float(number(it.get("pos")))
+            if rec["done"]:
+                rec["completed"] = int(number(it.get("completed"))) or rec["updated"]
+            rec["at"] = clean_at(rec, it, ITEM_GROUPS)
+        out["items"][iid] = rec
+    return out
+
+
+def newer(a, b):
+    """Whether record a wins over record b."""
+    return (a.get("updated", 0), a.get("by", "")) > (b.get("updated", 0), b.get("by", ""))
+
+
+def merge_record(x, y, groups, is_list):
+    """One record changed on two devices: each group of fields (a list's
+    name, its place, its lock; a to-do's text, its tick, its place) keeps
+    its later change, so a rename here and a new lock there both stay. A
+    removal wins over any change."""
+    if x.get("deleted") or y.get("deleted"):
+        if x.get("deleted") and y.get("deleted"):
+            return dict(y if newer(y, x) else x)
+        return dict(x if x.get("deleted") else y)
+    out = {}
+    if "list" in x:
+        out["list"] = x["list"]
+    at = {}
+    for g, keys in groups.items():
+        ax = tuple(x["at"][g])
+        ay = tuple(y["at"][g])
+        src = x if ax >= ay else y
+        for k in keys:
+            if k in src:
+                out[k] = src[k]
+        at[g] = list(max(ax, ay))
+    if is_list:
+        olds = {}
+        for o in (x.get("oldLocks") or []) + (y.get("oldLocks") or []):
+            olds[o["id"]] = o
+        current = (out.get("lock") or {}).get("id")
+        keep = [olds[k] for k in sorted(olds) if k != current][:MAX_OLD_LOCKS]
+        if keep:
+            out["oldLocks"] = keep
+    out["at"] = at
+    top = max(tuple(v) for v in at.values())
+    out["updated"], out["by"] = top[0], top[1]
+    return out
+
+
+def merge(a, b):
+    """Both devices' changes, record by record and field by field."""
+    out = empty_doc()
+    for part, groups in (("lists", LIST_GROUPS), ("items", ITEM_GROUPS)):
+        out[part] = dict(a[part])
+        for rid, rec in b[part].items():
+            mine = out[part].get(rid)
+            out[part][rid] = rec if mine is None else merge_record(mine, rec, groups, part == "lists")
+    return out
+
+
+def prune(doc, now):
+    """Tombstones past their 90 days are dropped."""
+    for part in ("lists", "items"):
+        for rid in [r for r, rec in doc[part].items() if rec.get("deleted") and now - rec.get("updated", 0) > KEEP_TOMBSTONES]:
+            del doc[part][rid]
+
+
+def same(a, b):
+    return json.dumps(a, sort_keys=True) == json.dumps(b, sort_keys=True)
+
+
+# ---------- The first name ----------
+
+def migrate_names():
+    """Files and the keyring entry of the plugin's first name, Reminders,
+    moved to the new names once. Nothing is overwritten."""
+    try:
+        if not os.path.exists(SETTINGS) and os.path.isfile(OLD_SETTINGS):
+            os.replace(OLD_SETTINGS, SETTINGS)
+        new_dir = os.path.dirname(STORE)
+        if not os.path.exists(new_dir) and os.path.isdir(OLD_DATA):
+            os.replace(OLD_DATA, new_dir)
+            old_store = os.path.join(new_dir, "reminders.enc")
+            if os.path.isfile(old_store) and not os.path.exists(STORE):
+                os.replace(old_store, STORE)
+    except OSError:
+        pass
+    if KEYRING != OLD_KEYRING and not keyring_get("master"):
+        old = keyring_get("master", OLD_KEYRING)
+        if old and keyring_set("master", old, "To-Do Lists (Omarchy)"):
+            keyring_clear("master", OLD_KEYRING)
+
+
+# ---------- The store ----------
+
+class Store:
+    def __init__(self):
+        self.lock = threading.RLock()
+        self.settings = self.read_settings()
+        self.doc = None          # the document, while it is open
+        self.dek = None          # the data key it is sealed with
+        self.header = None       # the envelope's header: the data key wrapped
+        self.version = CURRENT   # the file's version, and so its labels
+        self.recovery_shown = "" # a new recovery key, until it is saved
+        self.list_keys = {}      # lists unlocked until the panel closes: id -> (salt, key)
+        self.old_keys = {}       # keys of locks a list had before: salt -> key
+        self.notice = None
+        self.error = ""
+        self.sync = {"state": "off", "last": 0, "error": ""}
+        self.dirty = False       # changed here since the last push
+        self.sync_due = 0
+        self.syncing = False
+        self.etag = None
+        self.token = None
+        self.remembered = False
+
+    # ----- settings -----
+    def read_settings(self):
+        tighten(SETTINGS)
+        try:
+            data = json.loads(read_small(SETTINGS, 65536))
+        except (OSError, ValueError):
+            data = {}
+        data = data if isinstance(data, dict) else {}
+        out = {"device": data.get("device") if isinstance(data.get("device"), str) and re.fullmatch(r"[0-9a-f]{8,32}", data.get("device")) else secrets.token_hex(4)}
+        # The key that opens the panel (Service.qml binds it); "" for none.
+        hotkey = data.get("hotkey")
+        if isinstance(hotkey, str) and re.fullmatch(r"[A-Za-z0-9_: +]{0,60}", hotkey):
+            out["hotkey"] = hotkey.strip()
+        repo = data.get("repo")
+        if isinstance(repo, str) and re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repo):
+            out["repo"] = repo
+            path = data.get("path")
+            out["path"] = path if isinstance(path, str) and re.fullmatch(r"[A-Za-z0-9_./-]{1,200}", path) and ".." not in path else "todo-lists.enc"
+        if out != data:
+            try:
+                private_file(SETTINGS, json.dumps(out, indent=2) + "\n")
+            except OSError:
+                pass
+        return out
+
+    def write_settings(self):
+        private_file(SETTINGS, json.dumps(self.settings, indent=2) + "\n")
+
+    @property
+    def L(self):
+        return LABELS[self.version]
+
+    @property
+    def device(self):
+        return self.settings["device"]
+
+    # ----- opening -----
+    def stored_envelope(self):
+        try:
+            if os.stat(STORE).st_size > MAX_FILE:
+                raise ValueError("todo-lists.enc is larger than 16 MiB")
+            return json.loads(read_small(STORE))
+        except FileNotFoundError:
+            return None
+
+    def start(self):
+        if AESGCM is None:
+            self.error = "python-cryptography is missing: omarchy pkg add python-cryptography"
+            return
+        try:
+            env = self.stored_envelope()
+            if env is not None:
+                envelope_version(env)
+        except (OSError, ValueError) as e:
+            self.error = "Couldn't read todo-lists.enc: " + str(e)[:200]
+            return
+        if env is None:
+            return
+        # Tightened if something loosened it.
+        try:
+            if os.stat(STORE).st_mode & 0o077:
+                private_file(STORE, read_small(STORE))
+        except OSError:
+            pass
+        if env["v"] == 1:
+            return  # the password is typed once, and the file made anew
+        saved = keyring_get("master")
+        if not saved:
+            return
+        try:
+            dek = b64d(json.loads(saved)["dek"])
+            header = clean_header(env.get("header"))
+            doc = open_doc(env, dek)
+        except (ValueError, KeyError, TypeError):
+            return
+        if doc is None:
+            return
+        if "mac" in header and not header_ok(dek, header, LABELS[env["v"]]):
+            self.error = "The header of todo-lists.enc was changed outside To-Do Lists; it is not used"
+            return
+        self.remembered = "keyring"
+        self.opened(doc, dek, header, env["v"])
+        if "mac" not in header and env["v"] == CURRENT:
+            # Written before headers were signed: signed now (this file is
+            # this computer's own), and sent.
+            self.save()
+            self.dirty = True
+
+    def opened(self, doc, dek, header, version):
+        self.doc, self.dek, self.header, self.version = doc, dek, header, version
+        self.error = ""
+        if self.settings.get("repo"):
+            self.token = self.token or self.read_token()
+            self.sync["state"] = "idle" if self.token else "error"
+            self.sync["error"] = "" if self.token else "The GitHub token is missing; connect again"
+            self.sync_due = time.time()
+
+    # The token is kept beside the lists, sealed with their key: no keyring
+    # is needed for it, and it is only usable while the lists are open.
+    def read_token(self):
+        tighten(TOKEN)
+        try:
+            blob = b64d(read_small(TOKEN, 4096).strip())
+        except (OSError, ValueError):
+            return None
+        for label in (self.L["token"], LABELS[2]["token"]):
+            data = unseal(self.dek, blob, label)
+            if data:
+                return data.decode("utf-8", "replace")
+        return None
+
+    def write_token(self, token):
+        private_file(TOKEN, b64e(seal(self.dek, token.encode("utf-8"), self.L["token"])) + "\n")
+
+    def remember(self):
+        """The data key in the keyring, so the panel opens without asking:
+        "keyring", "session" (until the computer restarts) or False."""
+        self.remembered = keyring_set("master", json.dumps({"dek": b64e(self.dek)}), "To-Do Lists (Omarchy)")
+        return self.remembered
+
+    def state(self):
+        if AESGCM is None or (self.doc is None and self.error):
+            return "error"
+        if self.doc is not None:
+            return "ready"
+        return "locked" if os.path.exists(STORE) else "setup"
+
+    def show_recovery(self, code):
+        """A new recovery key, shown until the panel says it was saved."""
+        self.recovery_shown = code
+
+    def create(self, password):
+        if self.doc is not None or os.path.exists(STORE):
+            return self.say(False, "There are to-do lists here already")
+        problem = password_problem(password, MIN_PASSWORD)
+        if problem:
+            return self.say(False, problem)
+        dek = secrets.token_bytes(32)
+        header, code = new_header(dek, password, LABELS[CURRENT])
+        self.opened(empty_doc(), dek, header, CURRENT)
+        self.add_list("To-Do")
+        self.save()
+        self.remember()
+        self.show_recovery(code)
+        return self.say(True, "Created")
+
+    def unlock(self, password):
+        try:
+            env = self.stored_envelope()
+            version = envelope_version(env)
+            if version >= 2:
+                header = clean_header(env.get("header"))
+                dek = dek_from_password(header, password, LABELS[version])
+                doc = open_doc(env, dek) if dek else None
+            else:
+                doc = open_v1(env, password)
+        except (OSError, ValueError, AttributeError) as e:
+            return self.say(False, "Couldn't read todo-lists.enc: " + str(e)[:200])
+        if doc is None:
+            return self.say(False, "Wrong master password")
+        if version == 1:
+            # Made anew: a data key of its own, Argon2id, a recovery key.
+            dek = secrets.token_bytes(32)
+            header, code = new_header(dek, password, LABELS[CURRENT])
+            self.show_recovery(code)
+            self.opened(doc, dek, header, CURRENT)
+            self.save()
+            self.dirty = True
+        else:
+            if "mac" in header and not header_ok(dek, header, LABELS[version]):
+                return self.say(False, "The header of todo-lists.enc was changed outside To-Do Lists; it is not used")
+            self.opened(doc, dek, header, version)
+            if "mac" not in header and version == CURRENT:
+                self.save()
+                self.dirty = True
+        self.remember()
+        return self.say(True, "Unlocked")
+
+    def recover(self, code, password):
+        """A forgotten password: the recovery key opens the lists, and a new
+        password takes the old one's place."""
+        problem = password_problem(password, MIN_PASSWORD)
+        if problem:
+            return self.say(False, problem)
+        try:
+            env = self.stored_envelope()
+            version = envelope_version(env)
+            if version < 2:
+                return self.say(False, "This file has no recovery key yet")
+            L = LABELS[version]
+            header = clean_header(env.get("header"))
+        except (OSError, ValueError, AttributeError) as e:
+            return self.say(False, "Couldn't read todo-lists.enc: " + str(e)[:200])
+        priv = recovery_private(header, code, L)
+        if priv is None:
+            return self.say(False, "Wrong recovery key")
+        dek = unwrap_with(priv, header["recovery"]["wrapped"], L["rec_wrap"])
+        doc = open_doc(env, dek) if dek else None
+        if doc is None:
+            return self.say(False, "The recovery key does not open these lists")
+        if "mac" in header and not header_ok(dek, header, L):
+            return self.say(False, "The header of todo-lists.enc was changed outside To-Do Lists; it is not used")
+        header["password"] = password_block(dek, password, L)
+        header["at"] = now_ms()
+        self.opened(doc, dek, header, version)
+        self.save()
+        self.dirty = True
+        self.remember()
+        return self.say(True, "A new master password is set")
+
+    def new_recovery(self, password):
+        """A new recovery key; the old one stops working. Locked lists that
+        are unlocked here are wrapped for it now, the others when they are
+        next unlocked."""
+        if dek_from_password(self.header, password, self.L) != self.dek:
+            return self.say(False, "Wrong master password")
+        block, code = recovery_block(self.dek, self.L)
+        self.header["recovery"] = block
+        self.header["at"] = now_ms()
+        for lid, lst in self.live_lists():
+            key = self.current_key(lid)
+            if lst.get("lock") and key is not None:
+                self.rewrap_for_recovery(lst, key)
+        self.save()
+        self.dirty = True
+        self.show_recovery(code)
+        return self.say(True, "A new recovery key")
+
+    def upgrade(self, password):
+        """A version 2 file (the first name's labels) made version 3: the data
+        key wrapped anew with the master password, and a new recovery key.
+        A list lock is wrapped with its list password, which is not kept, so
+        locks must come off first (and go on again after)."""
+        if self.version != 2:
+            return False
+        if dek_from_password(self.header, password, self.L) != self.dek:
+            return self.say(False, "Wrong master password")
+        locked = [l["name"] for _, l in self.live_lists() if l.get("lock")]
+        if locked:
+            return self.say(False, "Take the lock off \u201c" + "\u201d, \u201c".join(locked) + "\u201d first (Lists), and lock it again after")
+        if any("sealed" in it for it in self.doc["items"].values() if not it.get("deleted")):
+            return self.say(False, "Some to-dos are still sealed with an older list password; open or delete them first")
+        for _, lst in self.live_lists():
+            lst.pop("oldLocks", None)
+        header, code = new_header(self.dek, password, LABELS[3])
+        self.header, self.version = header, 3
+        self.save()
+        self.dirty = True
+        try:
+            if self.token:
+                self.write_token(self.token)
+        except OSError:
+            pass
+        self.show_recovery(code)
+        return self.say(True, "Updated. Save the new recovery key; the old one no longer works")
+
+    def change_password(self, old, new):
+        if dek_from_password(self.header, old, self.L) != self.dek:
+            return self.say(False, "The current master password is wrong")
+        problem = password_problem(new, MIN_PASSWORD)
+        if problem:
+            return self.say(False, problem)
+        self.header["password"] = password_block(self.dek, new, self.L)
+        self.header["at"] = now_ms()
+        self.save()
+        self.dirty = True
+        return self.say(True, "The master password is changed; other devices go on without asking")
+
+    def forget(self):
+        keyring_clear("master")
+        self.remembered = False
+        self.doc = self.dek = self.header = None
+        self.token = None
+        self.list_keys = {}
+        self.old_keys = {}
+        self.sync = {"state": "off", "last": 0, "error": ""}
+        return self.say(True, "Forgotten on this computer; the master password opens it again")
+
+    def save(self):
+        prune(self.doc, now_ms())
+        private_file(STORE, json.dumps(envelope(self.doc, self.dek, self.header, self.version)) + "\n")
+
+    def say(self, ok, text):
+        self.notice = {"id": now_ms(), "ok": ok, "text": text}
+        return ok
+
+    # ----- records -----
+    def stamp(self, rec, groups=()):
+        """The record changed now, here: in these groups of its fields."""
+        t = max(now_ms(), rec.get("updated", 0) + 1)
+        for g in groups:
+            rec.setdefault("at", {})[g] = [t, self.device]
+        rec["updated"] = t
+        rec["by"] = self.device
+        return rec
+
+    def new_id(self):
+        while True:
+            i = secrets.token_hex(8)
+            if i not in self.doc["lists"] and i not in self.doc["items"]:
+                return i
+
+    def live_lists(self):
+        return sorted(((lid, l) for lid, l in self.doc["lists"].items() if not l.get("deleted")),
+                      key=lambda x: (x[1]["pos"], x[0]))
+
+    def live_items(self, lid):
+        return [(iid, it) for iid, it in self.doc["items"].items() if it["list"] == lid and not it.get("deleted")]
+
+    def open_items(self, lid):
+        return sorted(((i, it) for i, it in self.live_items(lid) if not it["done"]), key=lambda x: (x[1]["pos"], x[0]))
+
+    def add_list(self, name):
+        lists = self.live_lists()
+        if not name or len(lists) >= MAX_LISTS:
+            return False
+        pos = (lists[-1][1]["pos"] + 1) if lists else 1.0
+        self.doc["lists"][self.new_id()] = self.stamp({"name": name, "pos": pos}, LIST_GROUPS)
+        return True
+
+    # ----- keys of locked lists -----
+    def current_key(self, lid):
+        """The key of the list's lock now, while it is unlocked here."""
+        lock = self.doc["lists"].get(lid, {}).get("lock")
+        entry = self.list_keys.get(lid)
+        return entry[1] if lock and entry and entry[0] == lock["id"] else None
+
+    def key_for(self, lid, salt):
+        """Any key known here for the lock with this id."""
+        entry = self.list_keys.get(lid)
+        if entry and entry[0] == salt:
+            return entry[1]
+        return self.old_keys.get(salt)
+
+    def item_text(self, lid, it):
+        """The text of a to-do; None while no key here opens it (its list
+        is locked, or it was sealed with an older lock of its list)."""
+        if "sealed" not in it:
+            return it.get("text", "")
+        key = self.key_for(lid, it.get("k", ""))
+        if key is None:
+            return None
+        try:
+            blob = b64d(it["sealed"])
+            data = unseal(key, blob, self.L["list"]) or unseal(key, blob, LIST_AAD)
+            return clean(json.loads(data.decode("utf-8")).get("text"), MAX_TEXT) if data else None
+        except (ValueError, AttributeError, TypeError):
+            return None
+
+    def is_stale(self, lid, it):
+        """Sealed with a lock the list no longer has."""
+        lock = self.doc["lists"].get(lid, {}).get("lock")
+        return "sealed" in it and (not lock or it.get("k") != lock["id"])
+
+    def set_text(self, lid, rec, text):
+        lst = self.doc["lists"][lid]
+        if lst.get("lock"):
+            rec.pop("text", None)
+            rec["sealed"] = b64e(seal(self.current_key(lid), json.dumps({"text": text}).encode("utf-8"), self.L["list"]))
+            rec["k"] = lst["lock"]["id"]
+        else:
+            rec.pop("sealed", None)
+            rec.pop("k", None)
+            rec["text"] = text
+
+    def settle_keys(self):
+        """After a merge: a key kept for a lock its list no longer has is
+        an old key now. Then whatever old keys open is sealed again."""
+        for lid, (salt, key) in list(self.list_keys.items()):
+            lock = self.doc["lists"].get(lid, {}).get("lock")
+            if not lock or lock["id"] != salt:
+                self.old_keys[salt] = key
+                del self.list_keys[lid]
+        return self.heal_all()
+
+    def heal(self, lid):
+        """To-dos sealed with an older lock of their list, which a key
+        here opens: sealed again with the lock it has now (if it is unlocked
+        here), or kept as plain text (if it has no lock any more)."""
+        lst = self.doc["lists"].get(lid)
+        if not lst or lst.get("deleted"):
+            return False
+        if lst.get("lock") and self.current_key(lid) is None:
+            return False
+        changed = False
+        for _, it in self.live_items(lid):
+            if not self.is_stale(lid, it):
+                continue
+            text = self.item_text(lid, it)
+            if text is None:
+                continue
+            self.set_text(lid, it, text)
+            self.stamp(it, ("text",))
+            changed = True
+        return changed
+
+    def heal_all(self):
+        return any([self.heal(lid) for lid, _ in self.live_lists()])
+
+    # ----- changes -----
+    def renumber(self, records):
+        for n, (_, rec) in enumerate(records):
+            rec["pos"] = float(n + 1)
+            self.stamp(rec, ("pos",))
+
+    def place(self, records, rec, at):
+        """Gives rec a place among records (sorted, without it) at index at."""
+        before = records[at - 1][1]["pos"] if at > 0 else None
+        after = records[at][1]["pos"] if at < len(records) else None
+        if before is None and after is None:
+            rec["pos"] = 1.0
+        elif before is None:
+            rec["pos"] = after - 1
+        elif after is None:
+            rec["pos"] = before + 1
+        elif after - before > 1e-6:
+            rec["pos"] = (before + after) / 2
+        else:
+            records = records[:at] + [(None, rec)] + records[at:]
+            self.renumber(records)
+            return
+        self.stamp(rec, ("pos",))
+
+    def apply(self, op):
+        """One change; True when something changed."""
+        if not isinstance(op, dict):
+            return False
+        kind = op.get("op")
+        if kind == "addList":
+            return self.add_list(clean(op.get("name"), MAX_NAME))
+        lid = op.get("list")
+        lst = self.doc["lists"].get(lid) if isinstance(lid, str) else None
+        if lst is None or lst.get("deleted"):
+            return False
+        locked = bool(lst.get("lock")) and self.current_key(lid) is None
+        if kind == "renameList":
+            name = clean(op.get("name"), MAX_NAME)
+            if not name or name == lst["name"]:
+                return False
+            lst["name"] = name
+            self.stamp(lst, ("name",))
+            return True
+        if kind == "colorList":
+            if op.get("color") not in COLORS or op.get("color") == lst.get("color"):
+                return False
+            lst["color"] = op["color"]
+            self.stamp(lst, ("color",))
+            return True
+        if kind == "moveList":
+            lists = self.live_lists()
+            at = [x[0] for x in lists].index(lid)
+            to = max(0, min(len(lists) - 1, at + int(max(-100, min(100, number(op.get("by")))))))
+            if to == at:
+                return False
+            rest = [x for x in lists if x[0] != lid]
+            self.place(rest, lst, to)
+            return True
+        if kind == "removeList":
+            if locked:
+                return False
+            for _, it in self.live_items(lid):
+                self.tombstone(it)
+            self.tombstone(lst)
+            if not self.live_lists():
+                self.add_list("To-Do")
+            self.list_keys.pop(lid, None)
+            return True
+        if kind == "removeStale":
+            # Sealed with an older password nobody remembers: let go.
+            stale = [it for _, it in self.live_items(lid) if self.is_stale(lid, it) and self.item_text(lid, it) is None]
+            for it in stale:
+                self.tombstone(it)
+            return bool(stale)
+        if locked:
+            return False
+        if kind == "add":
+            text = clean(op.get("text"), MAX_TEXT)
+            if not text or len(self.live_items(lid)) >= MAX_ITEMS:
+                return False
+            rec = {"list": lid, "done": False}
+            self.set_text(lid, rec, text)
+            opened = self.open_items(lid)
+            rec["pos"] = (opened[-1][1]["pos"] + 1) if opened else 1.0
+            self.doc["items"][self.new_id()] = self.stamp(rec, ITEM_GROUPS)
+            return True
+        if kind == "clearDone":
+            done = [it for _, it in self.live_items(lid) if it["done"]]
+            for it in done:
+                self.tombstone(it)
+            return bool(done)
+        iid = op.get("item")
+        it = self.doc["items"].get(iid) if isinstance(iid, str) else None
+        if it is None or it.get("deleted") or it["list"] != lid:
+            return False
+        if kind == "edit":
+            text = clean(op.get("text"), MAX_TEXT)
+            if not text or text == self.item_text(lid, it):
+                return False
+            self.set_text(lid, it, text)
+            self.stamp(it, ("text",))
+            return True
+        if kind == "done":
+            done = op.get("done") is True
+            if done == it["done"]:
+                return False
+            it["done"] = done
+            if done:
+                it["completed"] = now_ms()
+                self.stamp(it, ("done",))
+            else:
+                it.pop("completed", None)
+                opened = self.open_items(lid)
+                it["pos"] = (opened[-1][1]["pos"] + 1) if opened else 1.0
+                self.stamp(it, ("done", "pos"))
+            return True
+        if kind == "remove":
+            self.tombstone(it)
+            return True
+        if kind == "moveTo":
+            # To another list, at the end of its open to-dos (or at `at`): a
+            # new record there (sealed with that list's key, when it is
+            # locked) and this one gone, in one change. A locked list it goes
+            # to must be open. `as` names the new record, so Undo can find it.
+            to = op.get("to")
+            dest = self.doc["lists"].get(to) if isinstance(to, str) else None
+            if dest is None or dest.get("deleted") or to == lid:
+                return False
+            if dest.get("lock") and self.current_key(to) is None:
+                return False
+            text = self.item_text(lid, it)
+            if text is None or len(self.live_items(to)) >= MAX_ITEMS:
+                return False
+            rec = {"list": to, "done": it["done"]}
+            if it["done"] and "completed" in it:
+                rec["completed"] = it["completed"]
+            self.set_text(to, rec, text)
+            opened = self.open_items(to)
+            at = op.get("at")
+            if not it["done"] and isinstance(at, (int, float)) and not isinstance(at, bool):
+                self.place(opened, rec, max(0, min(len(opened), int(at))))
+            else:
+                rec["pos"] = (opened[-1][1]["pos"] + 1) if opened else 1.0
+            new = op.get("as")
+            if not (isinstance(new, str) and re.fullmatch(r"[0-9a-f]{16}", new)
+                    and new not in self.doc["items"] and new not in self.doc["lists"]):
+                new = self.new_id()
+            self.doc["items"][new] = self.stamp(rec, ITEM_GROUPS)
+            self.tombstone(it)
+            return True
+        if kind == "move":
+            if it["done"]:
+                return False
+            opened = self.open_items(lid)
+            at = [x[0] for x in opened].index(iid)
+            to = at + int(max(-1000, min(1000, number(op.get("by")))))
+            if to == at or to < 0 or to >= len(opened):
+                return False
+            rest = [x for x in opened if x[0] != iid]
+            self.place(rest, it, to)
+            return True
+        return False
+
+    def tombstone(self, rec):
+        for k in [k for k in rec if k not in ("list", "updated", "by")]:
+            del rec[k]
+        rec["deleted"] = True
+        self.stamp(rec)
+
+    # ----- locked lists -----
+    def lock_key(self, lock, password):
+        """The key of a list's lock, opened with its password, or None."""
+        try:
+            if "kdf" in lock:
+                return unseal(derive_kdf(password, lock["kdf"]), b64d(lock["pw"]), self.L["list_password"])
+            key = pbkdf2(password, b64d(lock["salt"]), lock["iter"])
+            return key if unseal(key, b64d(lock["check"]), LIST_AAD) == b"ok" else None
+        except (ValueError, TypeError, KeyError):
+            return None
+
+    def lock_key_by_recovery(self, lock, code):
+        if "rec" not in lock:
+            return None
+        priv = recovery_private(self.header, code, self.L)
+        return unwrap_with(priv, lock["rec"], self.L["rec_wrap"]) if priv else None
+
+    def new_lock(self, key, lock_id, password):
+        """A version 2 lock for a list key: sealed with the password's key,
+        and wrapped for the recovery key."""
+        kdf = new_kdf()
+        pub = b64d(self.header["recovery"]["pub"])
+        return {"id": lock_id, "kdf": kdf, "pw": b64e(seal(derive_kdf(password, kdf), key, self.L["list_password"])),
+                "rec": wrap_to(pub, key, self.L["rec_wrap"]), "rp": recovery_id(self.header)}
+
+    def rewrap_for_recovery(self, lst, key):
+        """A lock wrapped for an older recovery key: wrapped for this one now.
+        Whether it was."""
+        lock = lst["lock"]
+        if "kdf" not in lock or lock.get("rp") == recovery_id(self.header):
+            return False
+        lock["rec"] = wrap_to(b64d(self.header["recovery"]["pub"]), key, self.L["rec_wrap"])
+        lock["rp"] = recovery_id(self.header)
+        self.stamp(lst, ("lock",))
+        return True
+
+    def unlock_list(self, lid, password):
+        """Shows a locked list; whether to-dos changed (sealed again, or a
+        version 1 lock made anew)."""
+        lst = self.doc["lists"].get(lid) if isinstance(lid, str) else None
+        if not lst or lst.get("deleted") or not lst.get("lock"):
+            return False
+        lock = lst["lock"]
+        key = self.lock_key(lock, password)
+        if key is None:
+            self.say(False, "Wrong password")
+            return False
+        changed = False
+        if "kdf" not in lock:
+            # A version 1 lock: the same key and id, now sealed with Argon2id
+            # and wrapped for the recovery key too. Its to-dos stay as
+            # they are.
+            lst["lock"] = self.new_lock(key, lock["id"], password)
+            self.stamp(lst, ("lock",))
+            changed = True
+        self.list_keys[lid] = (lock["id"], key)
+        changed = self.rewrap_for_recovery(lst, key) or changed
+        return self.heal(lid) or changed
+
+    def recover_list(self, lid, code, password):
+        """A list whose password is forgotten: the recovery key opens it,
+        and a new password (or none: the lock comes off) takes its place."""
+        lst = self.doc["lists"].get(lid) if isinstance(lid, str) else None
+        if not lst or lst.get("deleted") or not lst.get("lock"):
+            return False
+        if password:
+            problem = password_problem(password, MIN_LIST_PASSWORD)
+            if problem:
+                return self.say(False, problem)
+        key = self.lock_key_by_recovery(lst["lock"], code)
+        if key is None:
+            return self.say(False, "Wrong recovery key" if "rec" in lst["lock"] else "This lock is older than recovery keys")
+        self.list_keys[lid] = (lst["lock"]["id"], key)
+        if password:
+            lst["lock"] = self.new_lock(key, lst["lock"]["id"], password)
+            self.stamp(lst, ("lock",))
+            self.heal(lid)
+            return self.say(True, "A new list password is set")
+        self.remove_lock(lid)
+        return True
+
+    def change_list_password(self, lid, password):
+        """A new password for an unlocked list: the same key, sealed anew, so
+        its to-dos stay as they are, here and on every device."""
+        lst = self.doc["lists"].get(lid) if isinstance(lid, str) else None
+        key = self.current_key(lid)
+        if not lst or lst.get("deleted") or key is None:
+            return False
+        problem = password_problem(password, MIN_LIST_PASSWORD)
+        if problem:
+            return self.say(False, problem)
+        lst["lock"] = self.new_lock(key, lst["lock"]["id"], password)
+        self.stamp(lst, ("lock",))
+        return self.say(True, "The list password is changed")
+
+    def unlock_old(self, lid, secret):
+        """An older password of a list (or the recovery key), for to-dos
+        sealed with an older lock; they are sealed again with the lock the
+        list has now. Whether any were."""
+        lst = self.doc["lists"].get(lid) if isinstance(lid, str) else None
+        if not lst or lst.get("deleted"):
+            return False
+        wanted = {it.get("k") for _, it in self.live_items(lid) if self.is_stale(lid, it)}
+        by_recovery = parse_recovery(secret) is not None
+        found = False
+        for lock in lst.get("oldLocks") or []:
+            if lock["id"] in wanted and lock["id"] not in self.old_keys:
+                key = self.lock_key_by_recovery(lock, secret) if by_recovery else self.lock_key(lock, secret)
+                if key is not None:
+                    self.old_keys[lock["id"]] = key
+                    found = True
+        if not found:
+            self.say(False, "No older list password of this list matches")
+            return False
+        healed = self.heal(lid)
+        self.say(True, "Opened and sealed again with the list password" if lst.get("lock") else "Opened")
+        return healed
+
+    def set_lock(self, lid, password):
+        lst = self.doc["lists"].get(lid) if isinstance(lid, str) else None
+        if not lst or lst.get("deleted") or lst.get("lock"):
+            return False
+        problem = password_problem(password, MIN_LIST_PASSWORD)
+        if problem:
+            return self.say(False, problem)
+        key = secrets.token_bytes(32)
+        lst["lock"] = self.new_lock(key, b64e(secrets.token_bytes(12)), password)
+        self.stamp(lst, ("lock",))
+        self.list_keys[lid] = (lst["lock"]["id"], key)
+        for _, it in self.live_items(lid):
+            if "sealed" not in it:
+                self.set_text(lid, it, it.get("text", ""))
+                self.stamp(it, ("text",))
+        self.heal(lid)
+        return self.say(True, "Locked; it stays open until the panel closes")
+
+    def remove_lock(self, lid):
+        lst = self.doc["lists"].get(lid) if isinstance(lid, str) else None
+        if not lst or lst.get("deleted") or not lst.get("lock") or self.current_key(lid) is None:
+            return False
+        lock = lst["lock"]
+        # The old lock is remembered, with its key here, for to-dos another
+        # device seals with it before it hears of this.
+        self.old_keys[lock["id"]] = self.current_key(lid)
+        olds = [o for o in lst.get("oldLocks") or [] if o["id"] != lock["id"]]
+        lst["oldLocks"] = (olds + [lock])[-MAX_OLD_LOCKS:]
+        del lst["lock"]
+        self.stamp(lst, ("lock",))
+        self.list_keys.pop(lid, None)
+        self.heal(lid)
+        return self.say(True, "The lock is off")
+
+    # ----- the view -----
+    def view(self):
+        out = {"state": self.state(), "error": self.error, "notice": self.notice,
+               "repo": self.settings.get("repo", ""), "path": self.settings.get("path", ""),
+               "remembered": self.remembered, "recovery": self.recovery_shown,
+               "hotkey": self.settings.get("hotkey"),
+               "legacy": self.doc is not None and self.version == 2,
+               "sync": dict(self.sync), "lists": []}
+        if self.doc is None:
+            return out
+        for lid, l in self.live_lists():
+            lock = bool(l.get("lock"))
+            shown = not lock or self.current_key(lid) is not None
+            items = []
+            open_count = 0
+            stale = 0
+            for iid, it in self.live_items(lid):
+                if not it["done"]:
+                    open_count += 1
+                if not shown:
+                    continue
+                text = self.item_text(lid, it)
+                if text is None:
+                    stale += 1
+                    continue
+                items.append({"id": iid, "text": text, "done": it["done"],
+                              "pos": it["pos"], "completed": it.get("completed", 0)})
+            items.sort(key=lambda x: (x["done"], x["pos"] if not x["done"] else -x["completed"], x["id"]))
+            for x in items:
+                del x["pos"]
+            out["lists"].append({"id": lid, "name": l["name"], "color": l.get("color", ""), "locked": lock, "unlocked": lock and shown,
+                                 "recoverable": lock and "rec" in l["lock"] and l["lock"].get("rp") == recovery_id(self.header),
+                                 "open": open_count, "stale": stale, "items": items if shown else None})
+        return out
+
+    # ----- GitHub -----
+    def request(self, method, url, body=None, etag=None):
+        headers = {"Accept": "application/vnd.github+json", "Authorization": "Bearer " + self.token,
+                   "X-GitHub-Api-Version": "2022-11-28", "User-Agent": "mani4.todo-lists"}
+        if etag:
+            headers["If-None-Match"] = etag
+        data = None
+        if body is not None:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+        req = urllib.request.Request(url, data=data, method=method, headers=headers)
+        try:
+            with OPENER.open(req, timeout=20) as r:
+                return r.status, json.loads(r.read(MAX_FILE * 2) or b"{}"), r.headers.get("ETag")
+        except urllib.error.HTTPError as e:
+            try:
+                payload = json.loads(e.read(65536) or b"{}")
+            except ValueError:
+                payload = {}
+            return e.code, payload, None
+
+    def contents_url(self):
+        path = "/".join(urllib.request.quote(p) for p in self.settings["path"].split("/"))
+        return "%s/repos/%s/contents/%s" % (API, self.settings["repo"], path)
+
+    def fetch_remote(self):
+        """(status, envelope or None, sha); 304 when unchanged since last time."""
+        status, data, etag = self.request("GET", self.contents_url(), etag=self.etag)
+        if status == 304 or status == 404:
+            return status, None, None
+        if status != 200:
+            raise RuntimeError(github_error(status, data))
+        content = data.get("content")
+        if data.get("encoding") != "base64" or not isinstance(content, str):
+            # Past 1 MB the contents API leaves the content out; read the blob.
+            s, blob, _ = self.request("GET", "%s/repos/%s/git/blobs/%s" % (API, self.settings["repo"], data.get("sha")))
+            if s != 200:
+                raise RuntimeError(github_error(s, blob))
+            content = blob.get("content", "")
+        env = json.loads(base64.b64decode(content))
+        return status, env, data.get("sha"), etag
+
+    def sync_now(self):
+        """One round: fetch, merge, push when either side has something new."""
+        with self.lock:
+            if self.syncing or self.doc is None or not self.settings.get("repo") or not self.token:
+                return
+            self.syncing = True
+            self.sync["state"] = "syncing"
+        emit(self)
+        try:
+            for _ in range(4):
+                got = self.fetch_remote()
+                status = got[0]
+                with self.lock:
+                    if status == 304 and not self.dirty:
+                        break
+                    if status == 304:
+                        # Unchanged there, but changed here: fetched again in
+                        # full for its sha.
+                        self.etag = None
+                        continue
+                    sha = None
+                    if status == 200:
+                        _, env, sha, etag = got
+                        if envelope_version(env) < 2:
+                            raise RuntimeError("The file on GitHub is in the older format: open the panel once on the computer that wrote it")
+                        remote_header = clean_header(env.get("header"))
+                        remote_version = env["v"]
+                        remote = open_doc(env, self.dek)
+                        if remote is None:
+                            raise RuntimeError("The file on GitHub holds other lists (another key). Connect another file.")
+                        # Only a header signed with the data key is taken (or,
+                        # from before signing, the very one known here).
+                        if not header_ok(self.dek, remote_header, LABELS[remote_version], self.header):
+                            raise RuntimeError("The header of the file on GitHub was changed outside To-Do Lists; it is not used")
+                        # A password changed elsewhere: its header is newer.
+                        # (with its version: an update made there comes here)
+                        header_changed = remote_header["at"] > self.header["at"]
+                        if header_changed:
+                            self.header = remote_header
+                            self.version = remote_version
+                        merged = merge(self.doc, remote)
+                        prune(merged, now_ms())
+                        changed_here = not same(merged, self.doc)
+                        self.doc = merged
+                        # A lock changed elsewhere: keys here move along,
+                        # and what they open is sealed again.
+                        healed = self.settle_keys()
+                        if changed_here or healed or header_changed:
+                            self.save()
+                        if same(self.doc, remote) and same(unsigned(self.header), unsigned(remote_header)) and "mac" in remote_header \
+                                and self.version == remote_version:
+                            self.etag = etag
+                            self.dirty = False
+                            break
+                    body = {"message": "Update to-do lists",
+                            "content": b64e((json.dumps(envelope(self.doc, self.dek, self.header, self.version)) + "\n").encode("utf-8"))}
+                    if sha:
+                        body["sha"] = sha
+                    pushed_doc = json.dumps([self.doc, self.header], sort_keys=True)
+                p_status, p_data, _ = self.request("PUT", self.contents_url(), body)
+                if p_status in (200, 201):
+                    with self.lock:
+                        self.etag = None
+                        if json.dumps([self.doc, self.header], sort_keys=True) == pushed_doc:
+                            self.dirty = False
+                    break
+                if p_status in (409, 422):
+                    continue  # changed there meanwhile: again
+                raise RuntimeError(github_error(p_status, p_data))
+            with self.lock:
+                self.sync.update(state="ok", last=int(time.time()), error="")
+        except (urllib.error.URLError, TimeoutError, OSError) as e:
+            with self.lock:
+                self.sync.update(state="offline", error="Offline; it syncs when the network is back")
+                self.sync_due = time.time() + 60
+        except (RuntimeError, ValueError) as e:
+            with self.lock:
+                self.sync.update(state="error", error=str(e)[:300])
+        finally:
+            with self.lock:
+                self.syncing = False
+                if not self.sync_due or self.sync_due < time.time():
+                    self.sync_due = time.time() + SYNC_EVERY
+        emit(self)
+
+    def connect(self, repo, path, token, password):
+        repo = str(repo or "").strip()
+        repo = re.sub(r"^(https?://)?github\.com/", "", repo).strip("/")
+        if repo.endswith(".git"):
+            repo = repo[:-4]
+        path = str(path or "").strip().strip("/") or "todo-lists.enc"
+        token = str(token or "").strip()
+        if not re.fullmatch(r"[A-Za-z0-9_.-]{1,100}/[A-Za-z0-9_.-]{1,100}", repo):
+            return self.say(False, "Repository: owner/name")
+        if not re.fullmatch(r"[A-Za-z0-9_./-]{1,200}", path) or ".." in path:
+            return self.say(False, "File: a path like todo-lists.enc")
+        if not re.fullmatch(r"[A-Za-z0-9_]{20,255}", token):
+            return self.say(False, "Paste a GitHub token")
+        old = dict(self.settings), self.token
+        self.settings.update(repo=repo, path=path)
+        self.token = token
+        self.etag = None
+        try:
+            status, data, _ = self.request("GET", "%s/repos/%s" % (API, repo))
+            if status != 200:
+                raise RuntimeError(github_error(status, data))
+            if not data.get("private"):
+                raise RuntimeError("%s is public; use a private repository" % repo)
+            if self.doc is None:
+                # No lists here yet: the ones there, or new ones.
+                got = self.fetch_remote()
+                if got[0] == 200:
+                    env = got[1]
+                    if envelope_version(env) < 2:
+                        raise RuntimeError("The file on GitHub is in the older format: open the panel once on the computer that wrote it")
+                    header = clean_header(env.get("header"))
+                    dek = dek_from_password(header, password, LABELS[env["v"]])
+                    doc = open_doc(env, dek) if dek else None
+                    if doc is None:
+                        raise RuntimeError("Wrong master password for the file on GitHub")
+                    if not header_ok(dek, header, LABELS[env["v"]]):
+                        raise RuntimeError("The header of the file on GitHub is not signed; open the panel on a computer that has the lists first")
+                    self.opened(doc, dek, header, env["v"])
+                else:
+                    problem = password_problem(password, MIN_PASSWORD)
+                    if problem:
+                        raise RuntimeError(problem)
+                    dek = secrets.token_bytes(32)
+                    header, code = new_header(dek, password, LABELS[CURRENT])
+                    self.opened(empty_doc(), dek, header, CURRENT)
+                    self.add_list("To-Do")
+                    self.show_recovery(code)
+                    self.dirty = True
+                self.save()
+                self.remember()
+        except (RuntimeError, ValueError, urllib.error.URLError, TimeoutError, OSError) as e:
+            self.settings, self.token = old
+            msg = str(e)[:300] if isinstance(e, (RuntimeError, ValueError)) else "Couldn't reach GitHub"
+            return self.say(False, msg)
+        self.write_settings()
+        self.write_token(token)
+        self.dirty = True
+        self.sync.update(state="idle", error="")
+        self.sync_due = time.time()
+        return self.say(True, "Connected to " + repo)
+
+    def disconnect(self):
+        self.settings.pop("repo", None)
+        self.settings.pop("path", None)
+        self.write_settings()
+        try:
+            os.remove(TOKEN)
+        except FileNotFoundError:
+            pass
+        self.token = None
+        self.sync = {"state": "off", "last": 0, "error": ""}
+        return self.say(True, "Not syncing any more; the lists stay here")
+
+
+def github_error(status, data):
+    message = str((data or {}).get("message") or "")[:200]
+    if status == 401:
+        return "GitHub refused the token (expired or wrong)"
+    if status in (403, 404):
+        return "GitHub: no access to that repository or file with this token" + (" (" + message + ")" if message else "")
+    return "GitHub answered %d %s" % (status, message)
+
+
+def emit(store):
+    with store.lock:
+        line = json.dumps(store.view(), ensure_ascii=False)
+    sys.stdout.write(line + "\n")
+    sys.stdout.flush()
+
+
+def text(value):
+    return value[:1024] if isinstance(value, str) else ""
+
+
+def markdown(lists, day):
+    """The lists as Markdown, to keep or read anywhere: a heading per list and
+    a check box per to-do. A locked list not unlocked is named, not shown."""
+    out = ["# To-Do Lists", "", "_Exported " + day + "_"]
+    for lst in lists:
+        out += ["", "## " + lst["name"], ""]
+        if lst["items"] is None:
+            out.append("_Locked: unlock it, then export again to include it._")
+            continue
+        if not lst["items"]:
+            out.append("_Nothing to do._")
+        for it in lst["items"]:
+            out.append("- [" + ("x" if it["done"] else " ") + "] " + it["text"])
+    return "\n".join(out) + "\n"
+
+
+def export_path(day):
+    """A file of its own in ~/Documents (or home): never over another."""
+    home = os.path.expanduser("~")
+    folder = os.path.join(home, "Documents")
+    if not os.path.isdir(folder):
+        folder = home
+    base = os.path.join(folder, "To-Do Lists " + day)
+    path, n = base + ".md", 2
+    while os.path.exists(path):
+        path, n = base + " " + str(n) + ".md", n + 1
+    return path
+
+
+def handle(store, msg):
+    """One command from the panel; whether the lists changed."""
+    cmd = msg.get("cmd") if isinstance(msg, dict) else None
+    password = msg.get("password") if isinstance(msg, dict) and isinstance(msg.get("password"), str) else ""
+    password = password[:1024]
+    if cmd == "create":
+        return store.create(password)
+    if cmd == "unlock":
+        store.unlock(password)
+        return False
+    if cmd == "setHotkey":
+        hotkey = text(msg.get("hotkey")).strip()
+        if re.fullmatch(r"[A-Za-z0-9_: +]{0,60}", hotkey):
+            store.settings["hotkey"] = hotkey
+            try:
+                store.write_settings()
+            except OSError as e:
+                store.say(False, "Couldn't save the shortcut: " + str(e)[:200])
+        return False
+    if cmd == "recover":
+        store.recover(text(msg.get("code")), password)
+        return False
+    if cmd == "connect":
+        store.connect(msg.get("repo"), msg.get("path"), msg.get("token") if isinstance(msg.get("token"), str) else "", password)
+        return False
+    if store.doc is None:
+        return False
+    if cmd == "forget":
+        store.forget()
+        return False
+    if cmd == "disconnect":
+        store.disconnect()
+        return False
+    if cmd == "sync":
+        store.sync_due = time.time()
+        return False
+    if cmd == "lockLists":
+        store.list_keys = {}
+        store.old_keys = {}
+        return False
+    if cmd == "unlockList":
+        return store.unlock_list(msg.get("list"), password)
+    if cmd == "unlockOld":
+        return store.unlock_old(msg.get("list"), password)
+    if cmd == "recoverList":
+        return store.recover_list(msg.get("list"), text(msg.get("code")), password)
+    if cmd == "changeListPassword":
+        return store.change_list_password(msg.get("list"), password)
+    if cmd == "changePassword":
+        store.change_password(text(msg.get("old")), password)
+        return False
+    if cmd == "upgrade":
+        return store.upgrade(password)
+    if cmd == "newRecovery":
+        return store.new_recovery(password)
+    if cmd == "ackRecovery":
+        store.recovery_shown = ""
+        return False
+    if cmd == "export":
+        # Plain text, as asked: written only its owner can read.
+        day = time.strftime("%Y-%m-%d")
+        path = export_path(day)
+        try:
+            private_file(path, markdown(store.view()["lists"], day))
+            store.say(True, "Exported to " + path.replace(os.path.expanduser("~"), "~", 1))
+        except OSError as e:
+            store.say(False, "Couldn't export: " + str(e)[:200])
+        return False
+    if cmd == "setLock":
+        return store.set_lock(msg.get("list"), password)
+    if cmd == "removeLock":
+        return store.remove_lock(msg.get("list"))
+    if cmd == "op":
+        return store.apply(msg)
+    return False
+
+
+def settings_mtime():
+    try:
+        st = os.stat(SETTINGS)
+        return (st.st_mtime_ns, st.st_size)
+    except OSError:
+        return None
+
+
+def serve(store):
+    store.start()
+    emit(store)
+    fd = sys.stdin.fileno()
+    pending = b""
+    change_sync = 0
+    settings_stamp = settings_mtime()
+    while True:
+        # todo-lists.json edited by hand (the shortcut): read again.
+        if settings_mtime() != settings_stamp:
+            with store.lock:
+                fresh = store.read_settings()
+                store.settings["hotkey"] = fresh.get("hotkey", store.settings.get("hotkey"))
+                if "hotkey" not in fresh:
+                    store.settings.pop("hotkey", None)
+            settings_stamp = settings_mtime()
+            emit(store)
+        if b"\n" not in pending:
+            with store.lock:
+                waits = [store.sync_due, change_sync]
+            due = min([d for d in waits if d] or [time.time() + 5])
+            ready, _, _ = select.select([fd], [], [], max(0.05, min(5.0, due - time.time())))
+            if ready:
+                chunk = os.read(fd, 65536)
+                if not chunk:
+                    return
+                pending = (pending + chunk)[-(1 << 20):]
+        if b"\n" in pending:
+            line, pending = pending.split(b"\n", 1)
+            if len(line) > 65536:
+                continue
+            try:
+                msg = json.loads(line.decode("utf-8", "replace"))
+            except ValueError:
+                continue
+            with store.lock:
+                store.notice = None
+                changed = handle(store, msg)
+                if changed:
+                    try:
+                        store.save()
+                    except OSError as e:
+                        store.say(False, "Couldn't save: " + str(e)[:200])
+                    store.dirty = True
+                    change_sync = time.time() + SYNC_AFTER_CHANGE
+            emit(store)
+            continue
+        t = time.time()
+        if change_sync and t >= change_sync:
+            change_sync = 0
+            store.sync_due = t
+        with store.lock:
+            go = store.sync_due and t >= store.sync_due and store.doc is not None and store.token and not store.syncing
+            if go:
+                store.sync_due = 0
+        if go:
+            threading.Thread(target=store.sync_now, daemon=True).start()
+
+
+if __name__ == "__main__":
+    migrate_names()
+    try:
+        serve(Store())
+    except KeyboardInterrupt:
+        pass
